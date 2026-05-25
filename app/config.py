@@ -21,6 +21,9 @@ class AppConfig(BaseModel):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
     poll_interval_seconds: int = 300
+    macro_refresh_every_n_polls: int = 3
+    log_level: str = "INFO"
+    search_cache_seconds: int = 120
     swagger_title: str = "BigA Market API"
     swagger_description: str = ""
 
@@ -110,6 +113,18 @@ class Settings:
     @property
     def POLL_INTERVAL_SECONDS(self) -> int:
         return self.app.poll_interval_seconds
+
+    @property
+    def MACRO_REFRESH_EVERY_N_POLLS(self) -> int:
+        return self.app.macro_refresh_every_n_polls
+
+    @property
+    def LOG_LEVEL(self) -> str:
+        return self.app.log_level
+
+    @property
+    def SEARCH_CACHE_SECONDS(self) -> int:
+        return self.app.search_cache_seconds
 
     @property
     def SWAGGER_TITLE(self) -> str:

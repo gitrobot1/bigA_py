@@ -44,6 +44,12 @@ class WatchlistItem(WatchlistItemCreate):
     created_at: datetime
 
 
+class WatchlistItemWithQuote(WatchlistItem):
+    quote: Optional["QuoteResponse"] = Field(None, description="缓存中的最新行情")
+    quote_missing: bool = Field(False, description="true 表示暂无缓存行情")
+    quote_stale: bool = Field(False, description="true 表示行情可能过期，建议刷新")
+
+
 class PriceAlertCreate(BaseModel):
     symbol: str = Field(..., examples=["600519"])
     asset_type: AssetType
@@ -131,3 +137,14 @@ class RefreshStatusResponse(BaseModel):
     finished_at: str | None = None
     error: str | None = None
     cache: dict[str, Any] = Field(default_factory=dict)
+
+
+class MarketSummary(BaseModel):
+    poll_interval_seconds: int
+    macro_refresh_every_n_polls: int
+    indices: list[IndexQuote] = Field(default_factory=list)
+    cache: dict[str, Any] = Field(default_factory=dict)
+    refresh: dict[str, Any] = Field(default_factory=dict)
+
+
+WatchlistItemWithQuote.model_rebuild()

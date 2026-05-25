@@ -14,12 +14,16 @@ OPENAPI_TAGS = [
         "description": (
             "A 股、ETF 基金、黄金行情查询、搜索与图表走势。"
             "图表接口 `/market/chart/{asset_type}/{symbol}?range=today|1m|2m|3m|1y|3y|5y` 返回折线/K 线序列。"
+            "基金预估涨跌：`GET /market/fund/{symbol}/estimate-today`。"
             "行情缓存由后台定时从 AKShare 拉取至 Redis/MySQL。"
         ),
     },
     {
         "name": "自选",
-        "description": "用户自选标的 CRUD，加入自选后会被纳入定时行情拉取列表。",
+        "description": (
+            "用户自选标的 CRUD，加入自选后会被纳入定时行情拉取列表。"
+            "GET /watchlist/fund-estimates 可基于披露重仓估算自选基金今日涨跌。"
+        ),
     },
     {
         "name": "涨跌提醒",

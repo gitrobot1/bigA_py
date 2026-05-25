@@ -93,6 +93,50 @@ class QuoteCache:
     def get_quote(self, symbol: str, asset_type: str) -> QuoteSnapshot | None:
         return self._quotes.get(self.key(symbol, asset_type))
 
+    def resolve_snapshot(self, symbol: str, asset_type: str) -> QuoteSnapshot | None:
+        """统一查询：自选 stock/fund/gold + 全球指数 + 债券收益率。"""
+        quote = self.get_quote(symbol, asset_type)
+        if quote:
+            return quote
+        if asset_type == "global_index":
+            for item in self._global_indices:
+                if str(item.get("symbol")) == str(symbol):
+                    return QuoteSnapshot(
+                        symbol=str(item["symbol"]),
+                        name=str(item.get("name", symbol)),
+                        asset_type=asset_type,
+                        price=float(item.get("price", 0)),
+                        change_pct=float(item.get("change_pct", 0)),
+                        change_amount=item.get("change_amount"),
+                        data_source=item.get("data_source"),
+                    )
+        if asset_type == "bond_yield":
+            for item in self._bond_yields:
+                if str(item.get("symbol")) == str(symbol):
+                    y = item.get("yield", item.get("yield_"))
+                    return QuoteSnapshot(
+                        symbol=str(item["symbol"]),
+                        name=str(item.get("name", symbol)),
+                        asset_type=asset_type,
+                        price=float(y or 0),
+                        change_pct=float(item.get("change_pct") or 0),
+                        change_amount=item.get("change"),
+                        data_source=item.get("data_source"),
+                    )
+        return None
+
+    def quote_age_seconds(self, symbol: str, asset_type: str) -> float | None:
+        quote = self.resolve_snapshot(symbol, asset_type)
+        if not quote:
+            return None
+        return (datetime.utcnow() - quote.updated_at).total_seconds()
+
+    def is_quote_stale(self, symbol: str, asset_type: str, *, max_age_seconds: float = 600) -> bool:
+        age = self.quote_age_seconds(symbol, asset_type)
+        if age is None:
+            return True
+        return age > max_age_seconds
+
     def get_all_quotes(self) -> list[QuoteSnapshot]:
         return list(self._quotes.values())
 

@@ -182,6 +182,7 @@ uvicorn app.main:app --reload --port 8000
 |------|------|------|
 | GET | `/api/v1/market/status` | 轮询间隔、缓存状态 |
 | GET | `/api/v1/market/indices` | 主要指数 |
+| GET | `/api/v1/market/summary` | **个人看板摘要**（指数 + 刷新状态） |
 | GET | `/api/v1/market/quotes` | 行情列表 |
 | GET | `/api/v1/market/chart/{asset_type}/{symbol}?range=` | 图表（today/1m/2m/3m/1y/3y/5y） |
 | GET | `/api/v1/market/quotes/{asset_type}/{symbol}` | 单标的行情 |
@@ -195,8 +196,24 @@ uvicorn app.main:app --reload --port 8000
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/v1/watchlist` | 自选列表 |
+| GET | `/api/v1/watchlist/with-quotes` | **自选 + 缓存行情**（推荐看板用） |
 | POST | `/api/v1/watchlist` | 添加自选 |
 | DELETE | `/api/v1/watchlist/{item_id}` | 删除自选 |
+| GET | `/api/v1/watchlist/fund-estimates` | 自选基金今日预估涨跌（需登录） |
+
+### 基金预估涨跌
+
+基于**最近一期季报披露的股票重仓** × **当日 A 股涨跌幅**加权估算，仅供参考，非官方净值。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/market/fund/{symbol}/holdings` | 最近披露重仓股 |
+| GET | `/api/v1/market/fund/{symbol}/estimate-today` | 单只基金预估涨跌 |
+| GET | `/api/v1/watchlist/fund-estimates` | 自选内全部基金批量预估（需登录） |
+
+查询参数 `top_n`（默认 10）：每只基金纳入计算的重仓股数量上限。若基金已在行情缓存中，响应含 `actual_change_pct` 可与预估对比。
+
+**预估较慢或提示重仓股行情不可用**：先调用 `POST /api/v1/market/refresh` 刷新行情，再点预估；并确认本机未配置失效 HTTP 代理（东财接口易失败）。
 
 ### 涨跌提醒（需登录）
 
@@ -235,6 +252,9 @@ uvicorn app.main:app --reload --port 8000
 ```yaml
 app:
   poll_interval_seconds: 300   # 5 分钟；600 = 10 分钟
+  macro_refresh_every_n_polls: 3  # 每 3 轮才刷新全球指数/债券（约 15 分钟）
+  log_level: INFO
+  search_cache_seconds: 120    # 搜索结果的本地缓存秒数
 ```
 
 ## 常见问题

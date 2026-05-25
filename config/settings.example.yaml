@@ -8,6 +8,9 @@ app:
   algorithm: HS256
   access_token_expire_minutes: 1440
   poll_interval_seconds: 300
+  macro_refresh_every_n_polls: 3
+  log_level: INFO
+  search_cache_seconds: 120
   swagger_title: BigA Market API
   swagger_description: A股 / 基金ETF / 黄金 行情分析后端
 

@@ -1,8 +1,11 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from sqlalchemy import text
 
 from app.config import get_settings
 from app.core.database import SessionLocal, init_db
@@ -10,9 +13,35 @@ from app.core.openapi import OPENAPI_DESCRIPTION, OPENAPI_TAGS
 from app.core.redis_client import check_redis
 from app.routers import api_router
 from app.services.quote_cache import quote_cache
+from app.services.quote_provider import warmup_fund_name_cache
+from app.services.refresh_job import get_refresh_status
 from app.services.scheduler import start_scheduler, stop_scheduler
 
 settings = get_settings()
+
+
+def _setup_logging() -> None:
+    level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+
+_setup_logging()
+logger = logging.getLogger(__name__)
+
+
+def _check_database() -> bool:
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        logger.warning("数据库不可用: %s", e)
+        return False
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -24,6 +53,8 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     start_scheduler()
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, warmup_fund_name_cache)
     yield
     stop_scheduler()
 
@@ -87,15 +118,26 @@ def root():
         "docs": "/api/doc",
         "redoc": "/api/redoc",
         "poll_interval_seconds": settings.POLL_INTERVAL_SECONDS,
+        "macro_refresh_every_n_polls": settings.MACRO_REFRESH_EVERY_N_POLLS,
     }
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health_check():
-    """检查服务、配置文件路径及 Redis 连通性。"""
+    """检查服务、数据库、Redis 及最近一次行情刷新状态。"""
+    db_ok = _check_database()
+    redis_ok = check_redis()
+    cache = quote_cache.status()
+    refresh = get_refresh_status()
+    status = "ok" if db_ok else "degraded"
     return {
-        "status": "ok",
+        "status": status,
         "config_file": str(settings.config_file),
         "database": settings.database.name,
-        "redis": check_redis(),
+        "database_ok": db_ok,
+        "redis": redis_ok,
+        "last_refresh": cache.get("last_refresh"),
+        "last_error": cache.get("last_error"),
+        "quote_count": cache.get("quote_count"),
+        "refresh_job": refresh.get("status"),
     }

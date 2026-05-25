@@ -20,7 +20,10 @@ def global_catalog():
 
 
 @router.get("/indices", response_model=list[GlobalIndexQuote], summary="全球股指快照")
-def list_global_indices(refresh: bool = Query(False, description="true 时先提交后台刷新")):
+def list_global_indices(
+    refresh: bool = Query(False, description="true 时先提交后台刷新"),
+    region: str | None = Query(None, description="按地区过滤：us | europe | asia"),
+):
     if refresh:
         trigger_refresh_background(fast=True)
     items = quote_cache.get_global_indices()
@@ -28,6 +31,8 @@ def list_global_indices(refresh: bool = Query(False, description="true 时先提
         items = fetch_global_indices_spot()
         if items:
             quote_cache.set_global_indices(items)
+    if region:
+        items = [x for x in items if x.get("region") == region]
     return [GlobalIndexQuote(**x) for x in items]
 
 

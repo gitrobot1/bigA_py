@@ -2,7 +2,7 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable
 
@@ -15,6 +15,7 @@ from app.services.types import AssetType
 logger = logging.getLogger(__name__)
 
 _executor = ThreadPoolExecutor(max_workers=3)
+_estimate_executor = ThreadPoolExecutor(max_workers=8)
 _MAX_RETRIES = 2
 _RETRY_DELAY = 2.0
 
@@ -64,6 +65,28 @@ def _run_sync(fn, *args, **kwargs):
                     os.environ[k] = v
 
     return _executor.submit(_call).result()
+
+
+def _run_sync_timeout(fn, *args, timeout: float = 20.0, **kwargs):
+    """带超时的同步调用，避免外部数据源无响应时阻塞接口。"""
+
+    def _call():
+        saved = {k: os.environ.get(k) for k in _NO_PROXY_ENV}
+        os.environ.update(_NO_PROXY_ENV)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    fut = _estimate_executor.submit(_call)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError as e:
+        raise TimeoutError(f"数据源请求超时({timeout}s)") from e
 
 
 def _with_retry(label: str, fn: Callable, *args, **kwargs):
@@ -394,6 +417,173 @@ def _fetch_stocks_fast(codes: list[str]) -> list[QuoteSnapshot]:
     return list(quotes.values())
 
 
+def _quote_from_em_spot_df(df: pd.DataFrame, code: str) -> QuoteSnapshot | None:
+    subset = df[df["代码"].astype(str).str.zfill(6) == code]
+    if subset.empty:
+        return None
+    row = subset.iloc[0]
+    price = _safe_float(row.get("最新价"))
+    change_pct = _safe_float(row.get("涨跌幅"))
+    prev = _safe_float(row.get("昨收")) or (price / (1 + change_pct / 100) if change_pct else price)
+    return QuoteSnapshot(
+        symbol=code,
+        name=str(row.get("名称", code)),
+        asset_type=AssetType.STOCK.value,
+        price=price,
+        change_pct=change_pct,
+        change_amount=_safe_float(row.get("涨跌额")),
+        volume=_safe_float(row.get("成交量")),
+        amount=_safe_float(row.get("成交额")),
+        open_price=_safe_float(row.get("今开")),
+        high=_safe_float(row.get("最高")),
+        low=_safe_float(row.get("最低")),
+        prev_close=prev,
+        data_source="em_spot_batch",
+        updated_at=datetime.utcnow(),
+    )
+
+
+def _quote_from_sina_df(df: pd.DataFrame, code: str) -> QuoteSnapshot | None:
+    subset = df[_match_code(df["代码"], code)]
+    if subset.empty:
+        return None
+    row = subset.iloc[0]
+    return QuoteSnapshot(
+        symbol=code,
+        name=str(row.get("名称", code)),
+        asset_type=AssetType.STOCK.value,
+        price=_safe_float(row.get("最新价")),
+        change_pct=_safe_float(row.get("涨跌幅")),
+        change_amount=_safe_float(row.get("涨跌额")),
+        volume=_safe_float(row.get("成交量")),
+        amount=_safe_float(row.get("成交额")),
+        open_price=_safe_float(row.get("今开")),
+        high=_safe_float(row.get("最高")),
+        low=_safe_float(row.get("最低")),
+        prev_close=_safe_float(row.get("昨收")),
+        data_source="sina",
+        updated_at=datetime.utcnow(),
+    )
+
+
+def _quote_from_em_hist_once(code: str) -> QuoteSnapshot | None:
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+    try:
+        df = _run_sync_timeout(
+            ak.stock_zh_a_hist,
+            symbol=code,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="",
+            timeout=8,
+        )
+    except TimeoutError:
+        return None
+    if df is None or df.empty:
+        return None
+    row = df.iloc[-1]
+    price = _safe_float(row.get("收盘"))
+    change_pct = _safe_float(row.get("涨跌幅"))
+    return QuoteSnapshot(
+        symbol=code,
+        name=str(row.get("股票代码", code)),
+        asset_type=AssetType.STOCK.value,
+        price=price,
+        change_pct=change_pct,
+        change_amount=_safe_float(row.get("涨跌额")),
+        volume=_safe_float(row.get("成交量")),
+        amount=_safe_float(row.get("成交额")),
+        open_price=_safe_float(row.get("开盘")),
+        high=_safe_float(row.get("最高")),
+        low=_safe_float(row.get("最低")),
+        prev_close=price - _safe_float(row.get("涨跌额")),
+        data_source="em_daily",
+        updated_at=datetime.utcnow(),
+    )
+
+
+def fetch_stock_quotes_for_estimate(symbols: list[str]) -> dict[str, QuoteSnapshot]:
+    """
+    基金预估专用：优先缓存与全表批量匹配，缺失项并发单次拉取，不做逐只多源重试。
+    """
+    from app.services.quote_cache import quote_cache
+
+    codes = list(dict.fromkeys(normalize_stock_symbol(s) for s in symbols if s))
+    result: dict[str, QuoteSnapshot] = {}
+
+    for code in codes:
+        cached = quote_cache.get_quote(code, AssetType.STOCK.value)
+        if cached:
+            result[code] = cached
+
+    missing = [c for c in codes if c not in result]
+    if not missing:
+        return result
+
+    for label, fetch_table, mapper in [
+        ("东财全市场", lambda: _run_sync_timeout(ak.stock_zh_a_spot_em, timeout=12), _quote_from_em_spot_df),
+    ]:
+        if not missing:
+            break
+        try:
+            df = fetch_table()
+            before = len(result)
+            still: list[str] = []
+            for code in missing:
+                q = mapper(df, code)
+                if q:
+                    result[code] = q
+                else:
+                    still.append(code)
+            missing = still
+            if len(result) > before:
+                logger.info("预估行情 %s 补全 %d 只", label, len(result) - before)
+        except Exception as e:
+            logger.warning("预估行情 %s 失败: %s", label, e)
+
+    if missing and _sina_spot_cache is not None:
+        try:
+            before = len(result)
+            still: list[str] = []
+            for code in missing:
+                q = _quote_from_sina_df(_sina_spot_cache, code)
+                if q:
+                    result[code] = q
+                else:
+                    still.append(code)
+            missing = still
+            if len(result) > before:
+                logger.info("预估行情 新浪缓存 补全 %d 只", len(result) - before)
+        except Exception as e:
+            logger.warning("预估行情 新浪缓存 失败: %s", e)
+
+    if not missing:
+        return result
+
+    def _fetch_one(code: str) -> QuoteSnapshot | None:
+        return _quote_from_em_hist_once(code)
+
+    pool = ThreadPoolExecutor(max_workers=min(6, len(missing)))
+    futures = {pool.submit(_fetch_one, code): code for code in missing}
+    try:
+        for fut in as_completed(futures, timeout=18):
+            code = futures[fut]
+            try:
+                q = fut.result()
+                if q:
+                    result[code] = q
+            except Exception as e:
+                logger.debug("预估单股 %s 失败: %s", code, e)
+    except TimeoutError:
+        logger.warning("预估并发拉取超时，已返回部分重仓股行情")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    return result
+
+
 def fetch_stock_quotes(symbols: list[str], *, fast: bool = True) -> list[QuoteSnapshot]:
     if not symbols:
         return []
@@ -541,19 +731,113 @@ def fetch_gold_quotes(symbols: list[str]) -> list[QuoteSnapshot]:
 
 # ---------- 搜索 ----------
 
+_search_cache: dict[str, tuple[float, list[dict]]] = {}
+_fund_name_table_cache: tuple[float, pd.DataFrame] | None = None
+_FUND_NAME_CACHE_TTL = 86400  # 24h，基金名录变动不频繁
+
+
+def _get_fund_name_table() -> pd.DataFrame | None:
+    """东财全市场基金名录（含场外开放式、ETF 等），内存缓存。"""
+    global _fund_name_table_cache
+    now = time.time()
+    if _fund_name_table_cache and now - _fund_name_table_cache[0] < _FUND_NAME_CACHE_TTL:
+        return _fund_name_table_cache[1]
+    try:
+        df = _run_sync_timeout(ak.fund_name_em, timeout=45)
+        if df is not None and not df.empty:
+            _fund_name_table_cache = (now, df)
+            logger.info("基金名录已加载，共 %d 条", len(df))
+            return df
+    except Exception as e:
+        logger.warning("加载基金名录失败: %s", e)
+    return _fund_name_table_cache[1] if _fund_name_table_cache else None
+
+
+def warmup_fund_name_cache() -> None:
+    """应用启动时可调用，避免首次搜索等待过久。"""
+    _get_fund_name_table()
+
+
+def _search_funds_from_name_table(keyword: str, limit: int) -> list[dict]:
+    df = _get_fund_name_table()
+    if df is None or df.empty:
+        return []
+    results: list[dict] = []
+    code_col = "基金代码"
+    name_col = "基金简称"
+    if code_col not in df.columns or name_col not in df.columns:
+        return []
+    codes = df[code_col].astype(str)
+    names = df[name_col].astype(str)
+    mask = codes.str.contains(keyword, na=False, regex=False) | names.str.contains(keyword, na=False, regex=False)
+    for _, row in df[mask].head(limit).iterrows():
+        sym = str(row[code_col]).strip().zfill(6)
+        results.append(
+            {
+                "symbol": sym,
+                "name": str(row[name_col]),
+                "asset_type": AssetType.FUND.value,
+            }
+        )
+    return results
+
+
+def _search_funds_from_etf_spot(keyword: str, limit: int) -> list[dict]:
+    results: list[dict] = []
+    try:
+        df = _run_sync_timeout(ak.fund_etf_spot_em, timeout=30)
+        mask = df["代码"].astype(str).str.contains(keyword, na=False, regex=False) | df["名称"].astype(
+            str
+        ).str.contains(keyword, na=False, regex=False)
+        for _, row in df[mask].head(limit).iterrows():
+            sym = str(row["代码"]).strip()
+            if any(r["symbol"] == sym for r in results):
+                continue
+            results.append(
+                {"symbol": sym, "name": str(row["名称"]), "asset_type": AssetType.FUND.value}
+            )
+    except Exception as e:
+        logger.warning("搜索场内 ETF 列表失败: %s", e)
+    return results
+
 
 def search_symbols(keyword: str, asset_type: AssetType | None = None, limit: int = 20) -> list[dict]:
     keyword = keyword.strip()
     if not keyword:
         return []
+
+    from app.config import get_settings
+
+    cache_key = f"{keyword.lower()}|{asset_type}|{limit}"
+    ttl = get_settings().SEARCH_CACHE_SECONDS
+    now = time.time()
+    cached = _search_cache.get(cache_key)
+    if cached and now - cached[0] < ttl:
+        return list(cached[1])
+
     results: list[dict] = []
     types = [asset_type] if asset_type else [AssetType.STOCK, AssetType.FUND, AssetType.GOLD]
 
-    if AssetType.STOCK in types and len(results) < limit:
+    # 基金：先查全市场名录（含场外开放式），再补充场内 ETF 行情表
+    if AssetType.FUND in types and len(results) < limit:
+        name_hits = _search_funds_from_name_table(keyword, limit)
+        for item in name_hits:
+            if not any(r["symbol"] == item["symbol"] for r in results):
+                results.append(item)
+            if len(results) >= limit:
+                break
+        # 名录无结果时再拉场内 ETF 全表（较慢）
+        if not name_hits and len(results) < limit:
+            for item in _search_funds_from_etf_spot(keyword, limit - len(results)):
+                if not any(r["symbol"] == item["symbol"] for r in results):
+                    results.append(item)
+                if len(results) >= limit:
+                    break
+
+    # 仅在不限定为 fund 时搜 A 股（避免每次先拉全市场拖慢基金搜索）
+    if AssetType.STOCK in types and asset_type != AssetType.FUND and len(results) < limit:
         for fetch_table, source in [
-            (lambda: _run_sync(ak.stock_zh_a_spot_em), "em"),
-            (lambda: _get_sina_spot_table(), "sina"),
-            (lambda: _get_tx_spot_table(), "tx"),
+            (lambda: _run_sync_timeout(ak.stock_zh_a_spot_em, timeout=12), "em"),
         ]:
             if len(results) >= limit:
                 break
@@ -561,9 +845,9 @@ def search_symbols(keyword: str, asset_type: AssetType | None = None, limit: int
                 df = fetch_table()
                 code_col = "代码"
                 name_col = "名称"
-                mask = df[code_col].astype(str).str.contains(keyword, na=False) | df[name_col].astype(
-                    str
-                ).str.contains(keyword, na=False)
+                mask = df[code_col].astype(str).str.contains(keyword, na=False, regex=False) | df[
+                    name_col
+                ].astype(str).str.contains(keyword, na=False, regex=False)
                 for _, row in df[mask].head(limit - len(results)).iterrows():
                     sym = normalize_stock_symbol(str(row[code_col]))
                     if any(r["symbol"] == sym for r in results):
@@ -574,24 +858,15 @@ def search_symbols(keyword: str, asset_type: AssetType | None = None, limit: int
             except Exception as e:
                 logger.warning("搜索 A 股(%s)失败: %s", source, e)
 
-    if AssetType.FUND in types and len(results) < limit:
-        try:
-            df = _run_sync(ak.fund_etf_spot_em)
-            mask = df["代码"].str.contains(keyword, na=False) | df["名称"].str.contains(keyword, na=False)
-            for _, row in df[mask].head(limit - len(results)).iterrows():
-                results.append(
-                    {"symbol": str(row["代码"]), "name": str(row["名称"]), "asset_type": AssetType.FUND.value}
-                )
-        except Exception as e:
-            logger.warning("搜索基金失败: %s", e)
-
     if AssetType.GOLD in types and len(results) < limit:
         for sym, name in GOLD_SYMBOLS.items():
             if keyword in sym or keyword in name:
                 results.append({"symbol": sym, "name": name, "asset_type": AssetType.GOLD.value})
                 if len(results) >= limit:
                     break
-    return results[:limit]
+    final = results[:limit]
+    _search_cache[cache_key] = (now, final)
+    return final
 
 
 def clear_spot_caches() -> None:

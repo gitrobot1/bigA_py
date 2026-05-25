@@ -37,7 +37,7 @@ def evaluate_alerts(db: Session) -> list[AlertEvent]:
     alerts = db.query(PriceAlert).filter(PriceAlert.is_active == 1).all()
     events: list[AlertEvent] = []
     for alert in alerts:
-        quote = quote_cache.get_quote(alert.symbol, alert.asset_type)
+        quote = quote_cache.resolve_snapshot(alert.symbol, alert.asset_type)
         if not quote or not _matches(alert, quote):
             continue
         event = AlertEvent(

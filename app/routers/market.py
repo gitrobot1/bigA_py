@@ -1,3 +1,6 @@
+import asyncio
+from functools import partial
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -7,20 +10,28 @@ from app.schemas.chart import ChartSeriesResponse
 from app.schemas import (
     IndexQuote,
     MarketStatus,
+    MarketSummary,
     QuoteResponse,
     RefreshResponse,
     RefreshStatusResponse,
     RefreshTriggerResponse,
     SymbolSearchResult,
 )
+from app.schemas.fund_estimate import FundEstimateResponse, FundHoldingsResponse
 from app.services.chart_provider import ChartRange, fetch_chart_series
 from app.services import quote_provider
+from app.services.fund_estimate_provider import estimate_fund_today, fetch_latest_stock_holdings
 from app.services.quote_cache import quote_cache
+from app.services.market_data import refresh_market_data
+from app.services.market_refresh import try_run_refresh
 from app.services.refresh_job import get_refresh_status, is_refresh_running, trigger_refresh_background
-from app.services.scheduler import refresh_market_data
 from app.services.types import AssetType
 
 router = APIRouter()
+
+_ESTIMATE_TIMEOUT_SECONDS = 60
+_CHART_TIMEOUT_SECONDS = 30
+_SEARCH_TIMEOUT_SECONDS = 45
 
 
 @router.get(
@@ -40,6 +51,25 @@ def market_status():
     return MarketStatus(
         poll_interval_seconds=settings.POLL_INTERVAL_SECONDS,
         cache=status,
+    )
+
+
+@router.get(
+    "/summary",
+    response_model=MarketSummary,
+    summary="个人看板摘要",
+    description="国内指数 + 缓存/刷新状态，打开页面时可先调此接口。",
+)
+def market_summary():
+    settings = get_settings()
+    cache = quote_cache.status()
+    cache["redis_connected"] = check_redis()
+    return MarketSummary(
+        poll_interval_seconds=settings.POLL_INTERVAL_SECONDS,
+        macro_refresh_every_n_polls=settings.MACRO_REFRESH_EVERY_N_POLLS,
+        indices=[IndexQuote(**x) for x in quote_cache.get_indices()],
+        cache=cache,
+        refresh=get_refresh_status(),
     )
 
 
@@ -82,7 +112,7 @@ def list_quotes(
         "非交易时段 today 展示上一交易日分时。"
     ),
 )
-def get_chart(
+async def get_chart(
     asset_type: AssetType,
     symbol: str,
     range: ChartRange = Query(
@@ -92,7 +122,17 @@ def get_chart(
 ):
     if asset_type == AssetType.INDEX:
         raise HTTPException(status_code=400, detail="指数请使用 /market/indices，暂不支持图表接口")
-    data = fetch_chart_series(asset_type.value, symbol, range)
+    loop = asyncio.get_running_loop()
+    try:
+        data = await asyncio.wait_for(
+            loop.run_in_executor(None, partial(fetch_chart_series, asset_type.value, symbol, range)),
+            timeout=_CHART_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"图表数据拉取超时（>{_CHART_TIMEOUT_SECONDS}s），请稍后重试",
+        ) from e
     if not data["points"]:
         raise HTTPException(status_code=404, detail="暂无图表数据，请稍后重试或换一个数据源时段")
     return ChartSeriesResponse(**data)
@@ -117,12 +157,82 @@ def get_quote(asset_type: AssetType, symbol: str):
     summary="搜索标的",
     description="按代码或名称关键词搜索 A 股、ETF、黄金品种（实时请求数据源，可能较慢）。",
 )
-def search_symbols(
+async def search_symbols(
     q: str = Query(..., min_length=1, description="代码或名称关键词", examples=["茅台"]),
     asset_type: AssetType | None = Query(None, description="限定资产类型"),
     limit: int = Query(20, ge=1, le=50, description="返回条数上限"),
 ):
-    return quote_provider.search_symbols(q, asset_type, limit)
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                partial(quote_provider.search_symbols, q, asset_type, limit),
+            ),
+            timeout=_SEARCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"搜索超时（>{_SEARCH_TIMEOUT_SECONDS}s），请缩短关键词或稍后重试",
+        ) from e
+
+
+@router.get(
+    "/fund/{symbol}/holdings",
+    response_model=FundHoldingsResponse,
+    summary="基金最近披露股票重仓",
+    description="来自东财定期报告的股票投资明细，非实时持仓。",
+)
+def fund_holdings(
+    symbol: str,
+    top_n: int = Query(20, ge=5, le=50, description="返回重仓股条数上限"),
+):
+    try:
+        meta = fetch_latest_stock_holdings(symbol, top_n=top_n)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return FundHoldingsResponse(
+        symbol=meta["symbol"],
+        report_period=meta["report_period"],
+        report_year=meta["report_year"],
+        holding_count=meta["holding_count"],
+        stock_weight_pct=meta["stock_weight_pct"],
+        holdings=meta["holdings"],
+        data_source=meta["data_source"],
+    )
+
+
+@router.get(
+    "/fund/{symbol}/estimate-today",
+    response_model=FundEstimateResponse,
+    summary="单只基金今日预估涨跌",
+    description=(
+        "基于最近披露股票重仓与当日 A 股涨跌幅加权估算。"
+        "场内 ETF 若已在行情缓存中，返回 actual_change_pct 供对比。"
+    ),
+)
+async def fund_estimate_today(
+    symbol: str,
+    top_n: int = Query(10, ge=5, le=30, description="纳入计算的重仓股数量上限"),
+):
+    loop = asyncio.get_running_loop()
+    try:
+        data = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                partial(estimate_fund_today, symbol, top_n=top_n),
+            ),
+            timeout=_ESTIMATE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"预估计算超时（>{_ESTIMATE_TIMEOUT_SECONDS}s），请调小 top_n 或稍后重试",
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return FundEstimateResponse(**data)
 
 
 @router.post(
@@ -181,5 +291,7 @@ def refresh_status():
 def trigger_refresh_sync(full: bool = Query(False)):
     if is_refresh_running():
         raise HTTPException(status_code=409, detail="已有后台刷新进行中")
-    refresh_market_data(fast=not full)
+    ok = try_run_refresh(refresh_market_data, fast=not full, include_macro=True)
+    if not ok:
+        raise HTTPException(status_code=409, detail="已有刷新任务执行中")
     return RefreshResponse(message="刷新完成", cache=quote_cache.status())
